@@ -1,7 +1,16 @@
 const WebSocket = require('ws');
+const http = require('http');
 
 const PORT = process.env.PORT || 3000;
-const wss = new WebSocket.Server({ port: PORT });
+
+// Create HTTP server
+const server = http.createServer((req, res) => {
+  res.writeHead(200, { 'Content-Type': 'text/plain' });
+  res.end('8 Ball Pool WebSocket Server');
+});
+
+// Create WebSocket server attached to HTTP server
+const wss = new WebSocket.Server({ server });
 
 // Store active rooms
 const rooms = new Map();
@@ -251,8 +260,6 @@ wss.on('connection', (ws) => {
   });
 });
 
-console.log(`8 Ball Pool server running on port ${PORT}`);
-
 // Keep alive ping
 setInterval(() => {
   wss.clients.forEach(ws => {
@@ -261,3 +268,8 @@ setInterval(() => {
     }
   });
 }, 30000);
+
+// Start HTTP server
+server.listen(PORT, () => {
+  console.log(`8 Ball Pool server running on port ${PORT}`);
+});
