@@ -1,21 +1,12 @@
-const WebSocket = require('ws');
 const http = require('http');
 
 const PORT = process.env.PORT || 3000;
 
-// Create HTTP server
-const server = http.createServer((req, res) => {
-  res.writeHead(200, { 'Content-Type': 'text/plain' });
-  res.end('8 Ball Pool WebSocket Server');
-});
-
-// Create WebSocket server attached to HTTP server
-const wss = new WebSocket.Server({ server });
-
-// Store active rooms
+// Store rooms and messages
 const rooms = new Map();
+const messageQueues = new Map(); // playerId -> [messages]
 
-// Generate random room code
+// Generate random codes
 function generateRoomCode() {
   const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
   let code = '';
@@ -25,260 +16,251 @@ function generateRoomCode() {
   return code;
 }
 
-// Send JSON message to client
-function send(ws, type, data = {}) {
-  if (ws.readyState === WebSocket.OPEN) {
-    ws.send(JSON.stringify({ type, ...data }));
-  }
+function generatePlayerId() {
+  return Math.random().toString(36).substring(2, 15);
 }
 
-// Broadcast to all players in a room except sender
-function broadcastToRoom(roomCode, type, data, excludeWs = null) {
+// Get or create message queue for player
+function getQueue(playerId) {
+  if (!messageQueues.has(playerId)) {
+    messageQueues.set(playerId, []);
+  }
+  return messageQueues.get(playerId);
+}
+
+// Send message to player's queue
+function sendToPlayer(playerId, message) {
+  const queue = getQueue(playerId);
+  queue.push(message);
+}
+
+// Send to all players in room except one
+function sendToRoomExcept(roomCode, exceptPlayerId, message) {
   const room = rooms.get(roomCode);
   if (!room) return;
   
   room.players.forEach(player => {
-    if (player.ws !== excludeWs) {
-      send(player.ws, type, data);
+    if (player.id !== exceptPlayerId) {
+      sendToPlayer(player.id, message);
     }
   });
 }
 
-// Send to all players in room including sender
-function sendToRoom(roomCode, type, data) {
-  broadcastToRoom(roomCode, type, data, null);
+// Send to all players in room
+function sendToRoom(roomCode, message) {
+  const room = rooms.get(roomCode);
+  if (!room) return;
+  
+  room.players.forEach(player => {
+    sendToPlayer(player.id, message);
+  });
 }
 
-wss.on('connection', (ws) => {
-  console.log('Client connected');
+// Handle requests
+const server = http.createServer((req, res) => {
+  // CORS headers
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
   
-  ws.roomCode = null;
-  ws.playerNumber = null;
+  if (req.method === 'OPTIONS') {
+    res.writeHead(200);
+    res.end();
+    return;
+  }
   
-  ws.on('message', (message) => {
-    let msg;
-    try {
-      msg = JSON.parse(message);
-    } catch (e) {
-      console.log('Invalid JSON:', message);
+  // Parse URL
+  const url = new URL(req.url, `http://${req.headers.host}`);
+  const path = url.pathname;
+  
+  // Health check
+  if (path === '/' || path === '/health') {
+    res.writeHead(200, { 'Content-Type': 'text/plain' });
+    res.end('8 Ball Pool Server OK');
+    return;
+  }
+  
+  // Handle POST requests
+  if (req.method === 'POST') {
+    let body = '';
+    req.on('data', chunk => body += chunk);
+    req.on('end', () => {
+      try {
+        const data = JSON.parse(body);
+        handleAction(path, data, res);
+      } catch (e) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Invalid JSON' }));
+      }
+    });
+    return;
+  }
+  
+  // Handle GET requests (polling)
+  if (req.method === 'GET' && path === '/poll') {
+    const playerId = url.searchParams.get('playerId');
+    if (!playerId) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Missing playerId' }));
       return;
     }
     
-    console.log('Received:', msg.type, msg);
+    const queue = getQueue(playerId);
+    const messages = queue.splice(0, queue.length); // Get and clear
     
-    switch (msg.type) {
-      
-      case 'create_room': {
-        // Generate unique room code
-        let roomCode;
-        do {
-          roomCode = generateRoomCode();
-        } while (rooms.has(roomCode));
-        
-        // Create room
-        rooms.set(roomCode, {
-          players: [{ ws, name: msg.name || 'Player 1' }],
-          currentTurn: 1,
-          gameStarted: false,
-          ballPositions: null
-        });
-        
-        ws.roomCode = roomCode;
-        ws.playerNumber = 1;
-        
-        send(ws, 'room_created', { roomCode, playerNumber: 1 });
-        console.log(`Room ${roomCode} created`);
-        break;
-      }
-      
-      case 'join_room': {
-        const roomCode = msg.roomCode.toUpperCase();
-        const room = rooms.get(roomCode);
-        
-        if (!room) {
-          send(ws, 'error', { message: 'Room not found' });
-          return;
-        }
-        
-        if (room.players.length >= 2) {
-          send(ws, 'error', { message: 'Room is full' });
-          return;
-        }
-        
-        // Add player to room
-        room.players.push({ ws, name: msg.name || 'Player 2' });
-        ws.roomCode = roomCode;
-        ws.playerNumber = 2;
-        
-        send(ws, 'room_joined', { 
-          roomCode, 
-          playerNumber: 2,
-          opponentName: room.players[0].name
-        });
-        
-        // Notify player 1
-        send(room.players[0].ws, 'opponent_joined', {
-          opponentName: msg.name || 'Player 2'
-        });
-        
-        // Start game
-        room.gameStarted = true;
-        room.currentTurn = 1;
-        
-        sendToRoom(roomCode, 'game_start', {
-          currentTurn: 1,
-          player1Name: room.players[0].name,
-          player2Name: room.players[1].name
-        });
-        
-        console.log(`Player joined room ${roomCode}, game starting`);
-        break;
-      }
-      
-      case 'aim_update': {
-        // Relay aiming info to opponent (live aim preview)
-        if (ws.roomCode) {
-          broadcastToRoom(ws.roomCode, 'opponent_aim', {
-            aiming: msg.aiming,
-            direction: msg.direction,
-            power: msg.power
-          }, ws);
-        }
-        break;
-      }
-      
-      case 'shoot': {
-        // Relay shot to opponent
-        if (ws.roomCode) {
-          const room = rooms.get(ws.roomCode);
-          if (room && room.currentTurn === ws.playerNumber) {
-            broadcastToRoom(ws.roomCode, 'opponent_shot', {
-              direction: msg.direction,
-              power: msg.power
-            }, ws);
-          }
-        }
-        break;
-      }
-      
-      case 'turn_end': {
-        // Called when balls stop moving, sync positions and switch turn
-        if (ws.roomCode) {
-          const room = rooms.get(ws.roomCode);
-          if (room) {
-            // Switch turn
-            room.currentTurn = room.currentTurn === 1 ? 2 : 1;
-            
-            sendToRoom(ws.roomCode, 'turn_change', {
-              currentTurn: room.currentTurn,
-              ballPositions: msg.ballPositions,
-              scores: msg.scores,
-              pocketed: msg.pocketed
-            });
-          }
-        }
-        break;
-      }
-      
-      case 'ball_pocketed': {
-        // Sync when a ball is pocketed
-        if (ws.roomCode) {
-          broadcastToRoom(ws.roomCode, 'ball_pocketed', {
-            ballNumber: msg.ballNumber
-          }, ws);
-        }
-        break;
-      }
-      
-      case 'game_over': {
-        if (ws.roomCode) {
-          sendToRoom(ws.roomCode, 'game_over', {
-            winner: msg.winner
-          });
-        }
-        break;
-      }
-      
-      case 'rematch': {
-        if (ws.roomCode) {
-          const room = rooms.get(ws.roomCode);
-          if (room) {
-            if (!room.rematchVotes) room.rematchVotes = new Set();
-            room.rematchVotes.add(ws.playerNumber);
-            
-            if (room.rematchVotes.size >= 2) {
-              // Both want rematch
-              room.rematchVotes.clear();
-              room.currentTurn = 1;
-              sendToRoom(ws.roomCode, 'rematch_start', {
-                currentTurn: 1
-              });
-            } else {
-              // Notify other player
-              broadcastToRoom(ws.roomCode, 'rematch_request', {}, ws);
-            }
-          }
-        }
-        break;
-      }
-      
-      case 'chat': {
-        if (ws.roomCode) {
-          broadcastToRoom(ws.roomCode, 'chat', {
-            message: msg.message,
-            from: ws.playerNumber
-          }, ws);
-        }
-        break;
-      }
-    }
-  });
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ messages }));
+    return;
+  }
   
-  ws.on('close', () => {
-    console.log('Client disconnected');
-    
-    if (ws.roomCode) {
-      const room = rooms.get(ws.roomCode);
-      if (room) {
-        // Notify other player
-        broadcastToRoom(ws.roomCode, 'opponent_left', {}, ws);
-        
-        // Remove player from room
-        room.players = room.players.filter(p => p.ws !== ws);
-        
-        // Delete room if empty
-        if (room.players.length === 0) {
-          rooms.delete(ws.roomCode);
-          console.log(`Room ${ws.roomCode} deleted`);
-        }
-      }
-    }
-  });
-  
-  ws.on('error', (error) => {
-    console.log('WebSocket error:', error);
-  });
-  
-  // Track if client is alive
-  ws.isAlive = true;
-  ws.on('pong', () => {
-    ws.isAlive = true;
-  });
+  res.writeHead(404, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({ error: 'Not found' }));
 });
 
-// Keep alive ping every 25 seconds (under most platform timeouts)
-setInterval(() => {
-  wss.clients.forEach(ws => {
-    if (ws.isAlive === false) {
-      console.log('Terminating dead connection');
-      return ws.terminate();
+function handleAction(path, data, res) {
+  const response = { success: true };
+  
+  switch (path) {
+    case '/create': {
+      const playerId = generatePlayerId();
+      let roomCode;
+      do {
+        roomCode = generateRoomCode();
+      } while (rooms.has(roomCode));
+      
+      rooms.set(roomCode, {
+        players: [{ id: playerId, name: data.name || 'Player 1', number: 1 }],
+        currentTurn: 1,
+        gameStarted: false
+      });
+      
+      response.playerId = playerId;
+      response.roomCode = roomCode;
+      response.playerNumber = 1;
+      console.log(`Room ${roomCode} created by ${data.name}`);
+      break;
     }
-    ws.isAlive = false;
-    ws.ping();
-  });
-}, 25000);
+    
+    case '/join': {
+      const roomCode = (data.roomCode || '').toUpperCase();
+      const room = rooms.get(roomCode);
+      
+      if (!room) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Room not found' }));
+        return;
+      }
+      
+      if (room.players.length >= 2) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Room is full' }));
+        return;
+      }
+      
+      const playerId = generatePlayerId();
+      const playerName = data.name || 'Player 2';
+      room.players.push({ id: playerId, name: playerName, number: 2 });
+      room.gameStarted = true;
+      
+      response.playerId = playerId;
+      response.roomCode = roomCode;
+      response.playerNumber = 2;
+      response.opponentName = room.players[0].name;
+      
+      // Notify player 1
+      sendToPlayer(room.players[0].id, {
+        type: 'opponent_joined',
+        opponentName: playerName
+      });
+      
+      // Send game start to both
+      sendToRoom(roomCode, {
+        type: 'game_start',
+        currentTurn: 1,
+        player1Name: room.players[0].name,
+        player2Name: playerName
+      });
+      
+      console.log(`${playerName} joined room ${roomCode}`);
+      break;
+    }
+    
+    case '/shoot': {
+      const room = rooms.get(data.roomCode);
+      if (room) {
+        sendToRoomExcept(data.roomCode, data.playerId, {
+          type: 'opponent_shot',
+          direction: data.direction,
+          power: data.power
+        });
+      }
+      break;
+    }
+    
+    case '/aim': {
+      const room = rooms.get(data.roomCode);
+      if (room) {
+        sendToRoomExcept(data.roomCode, data.playerId, {
+          type: 'opponent_aim',
+          aiming: data.aiming,
+          direction: data.direction,
+          power: data.power
+        });
+      }
+      break;
+    }
+    
+    case '/turn_end': {
+      const room = rooms.get(data.roomCode);
+      if (room) {
+        room.currentTurn = room.currentTurn === 1 ? 2 : 1;
+        sendToRoom(data.roomCode, {
+          type: 'turn_change',
+          currentTurn: room.currentTurn,
+          ballPositions: data.ballPositions,
+          scores: data.scores
+        });
+      }
+      break;
+    }
+    
+    case '/leave': {
+      const room = rooms.get(data.roomCode);
+      if (room) {
+        sendToRoomExcept(data.roomCode, data.playerId, {
+          type: 'opponent_left'
+        });
+        room.players = room.players.filter(p => p.id !== data.playerId);
+        if (room.players.length === 0) {
+          rooms.delete(data.roomCode);
+          console.log(`Room ${data.roomCode} deleted`);
+        }
+      }
+      // Clean up message queue
+      messageQueues.delete(data.playerId);
+      break;
+    }
+    
+    default:
+      res.writeHead(404, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Unknown action' }));
+      return;
+  }
+  
+  res.writeHead(200, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify(response));
+}
 
-// Start HTTP server
+// Clean up old empty rooms periodically
+setInterval(() => {
+  const now = Date.now();
+  rooms.forEach((room, code) => {
+    if (room.players.length === 0) {
+      rooms.delete(code);
+    }
+  });
+}, 60000);
+
 server.listen(PORT, () => {
-  console.log(`8 Ball Pool server running on port ${PORT}`);
+  console.log(`8 Ball Pool HTTP server running on port ${PORT}`);
 });
